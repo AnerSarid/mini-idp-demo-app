@@ -35,8 +35,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  STATE_BUCKET: mini-idp-terraform-state
-  AWS_REGION: us-east-1
+  STATE_BUCKET: ${{ vars.STATE_BUCKET }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPO: ${{ vars.ECR_REPO }}
 
 jobs:
   # -----------------------------------------------------------------
@@ -255,7 +256,7 @@ jobs:
         run: |
           set -euo pipefail
           ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
-          ECR_REPO="mini-idp-preview"
+          ECR_REPO="${{ env.ECR_REPO }}"
           ENV_NAME="${{ needs.setup.outputs.environment_name }}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"

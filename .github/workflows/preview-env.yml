@@ -1,11 +1,15 @@
 # Preview Environment — powered by mini-idp
 #
-# Calls the reusable workflow from the mini-idp platform repo.
-# Configuration is read from .idp/config.yml in this repository.
+# Copy this workflow into your repo's .github/workflows/ directory.
+# Configure your app in .idp/config.yml at the repo root.
 #
-# Required setup in this repo's GitHub Settings:
-#   Secrets:  AWS_ROLE_ARN
-#   Variables: PREVIEW_ACM_CERT_ARN, PREVIEW_ZONE_ID, PREVIEW_DOMAIN
+# The heavy lifting (provision, destroy, dashboard) is handled by reusable
+# workflows in the mini-idp platform repo — no need to maintain them here.
+#
+# Required repo settings:
+#   Secrets:    AWS_ROLE_ARN
+#   Variables:  PREVIEW_ACM_CERT_ARN, PREVIEW_ZONE_ID, PREVIEW_DOMAIN
+#   Environment: "production" (create in Settings > Environments)
 
 name: Preview Environment
 
@@ -26,7 +30,414 @@ permissions:
   pull-requests: write
   actions: write
 
+concurrency:
+  group: preview-${{ github.event.pull_request.head.ref || github.event.ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  STATE_BUCKET: mini-idp-terraform-state
+  AWS_REGION: us-east-1
+
 jobs:
-  preview:
-    uses: AnerSarid/mini-idp/.github/workflows/preview-env.yml@main
+  # -----------------------------------------------------------------
+  # Setup — determine action, sanitize branch name, read config
+  # -----------------------------------------------------------------
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    if: github.event.ref_type != 'tag'
+    outputs:
+      environment_name: ${{ steps.sanitize.outputs.environment_name }}
+      action: ${{ steps.decide.outputs.action }}
+      template: ${{ steps.config.outputs.template }}
+      ttl: ${{ steps.config.outputs.ttl }}
+      owner: ${{ steps.config.outputs.owner }}
+      container_image: ${{ steps.config.outputs.container_image }}
+      container_port: ${{ steps.config.outputs.container_port }}
+      dockerfile: ${{ steps.config.outputs.dockerfile }}
+      build_context: ${{ steps.config.outputs.build_context }}
+      environment_variables: ${{ steps.config.outputs.environment_variables }}
+      secret_variables: ${{ steps.config.outputs.secret_variables }}
+      schedule_expression: ${{ steps.config.outputs.schedule_expression }}
+      s3_bucket_arn: ${{ steps.config.outputs.s3_bucket_arn }}
+      cpu: ${{ steps.config.outputs.cpu }}
+      memory: ${{ steps.config.outputs.memory }}
+      log_retention_days: ${{ steps.config.outputs.log_retention_days }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        if: github.event_name == 'push'
+
+      - name: Determine branch name
+        id: branch
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            BRANCH="${{ github.ref_name }}"
+          elif [[ "${{ github.event_name }}" == "delete" ]]; then
+            BRANCH="${{ github.event.ref }}"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+          fi
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Branch: ${BRANCH}"
+
+      - name: Sanitize branch name to environment name
+        id: sanitize
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          CLEAN=$(echo "$BRANCH" | sed -E 's#^(feature|bugfix|hotfix|fix|chore|release)/##')
+          CLEAN=$(echo "$CLEAN" | tr '[:upper:]' '[:lower:]')
+          CLEAN=$(echo "$CLEAN" | sed 's/[^a-z0-9-]/-/g')
+          CLEAN=$(echo "$CLEAN" | sed 's/-\{2,\}/-/g')
+          CLEAN=$(echo "$CLEAN" | sed 's/^-//; s/-$//')
+          CLEAN=$(echo "$CLEAN" | cut -c1-24)
+          CLEAN=$(echo "$CLEAN" | sed 's/-$//')
+          ENV_NAME="preview-${CLEAN}"
+          echo "environment_name=${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Environment name: ${ENV_NAME}"
+
+      - name: Read .idp/config.yml or use defaults
+        id: config
+        run: |
+          set -euo pipefail
+          CONFIG_FILE=".idp/config.yml"
+          if [[ "${{ github.event_name }}" == "push" && -f "$CONFIG_FILE" ]]; then
+            echo "Found $CONFIG_FILE, reading configuration..."
+            if ! command -v yq &> /dev/null; then
+              wget -qO /usr/local/bin/yq \
+                https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+              chmod +x /usr/local/bin/yq
+            fi
+            TEMPLATE=$(yq eval '.template // "api-service"' "$CONFIG_FILE")
+            TTL=$(yq eval '.ttl // "7d"' "$CONFIG_FILE")
+            CONTAINER_IMAGE=$(yq eval '.container_image // "nginx:alpine"' "$CONFIG_FILE")
+            CONTAINER_PORT=$(yq eval '.container_port // 80' "$CONFIG_FILE")
+            DOCKERFILE=$(yq eval '.dockerfile // ""' "$CONFIG_FILE")
+            BUILD_CONTEXT=$(yq eval '.build_context // "."' "$CONFIG_FILE")
+            ENV_VARS=$(yq eval -o=json -I0 '.environment // {}' "$CONFIG_FILE")
+            SECRET_VARS=$(yq eval -o=json -I0 '.secrets // {}' "$CONFIG_FILE")
+            SCHEDULE_EXPR=$(yq eval '.schedule_expression // ""' "$CONFIG_FILE")
+            S3_BUCKET=$(yq eval '.s3_bucket_arn // ""' "$CONFIG_FILE")
+            CPU=$(yq eval '.cpu // "256"' "$CONFIG_FILE")
+            MEMORY=$(yq eval '.memory // "512"' "$CONFIG_FILE")
+            LOG_RETENTION=$(yq eval '.log_retention_days // "3"' "$CONFIG_FILE")
+          else
+            echo "Using defaults (no config file or non-push event)..."
+            TEMPLATE="api-service"
+            TTL="7d"
+            CONTAINER_IMAGE="nginx:alpine"
+            CONTAINER_PORT="80"
+            DOCKERFILE=""
+            BUILD_CONTEXT="."
+            ENV_VARS="{}"
+            SECRET_VARS="{}"
+            SCHEDULE_EXPR=""
+            S3_BUCKET=""
+            CPU="256"
+            MEMORY="512"
+            LOG_RETENTION="3"
+          fi
+          echo "template=${TEMPLATE}" >> "$GITHUB_OUTPUT"
+          echo "ttl=${TTL}" >> "$GITHUB_OUTPUT"
+          echo "container_image=${CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "container_port=${CONTAINER_PORT}" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=${DOCKERFILE}" >> "$GITHUB_OUTPUT"
+          echo "build_context=${BUILD_CONTEXT}" >> "$GITHUB_OUTPUT"
+          echo "environment_variables=${ENV_VARS}" >> "$GITHUB_OUTPUT"
+          echo "secret_variables=${SECRET_VARS}" >> "$GITHUB_OUTPUT"
+          echo "schedule_expression=${SCHEDULE_EXPR}" >> "$GITHUB_OUTPUT"
+          echo "s3_bucket_arn=${S3_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "cpu=${CPU}" >> "$GITHUB_OUTPUT"
+          echo "memory=${MEMORY}" >> "$GITHUB_OUTPUT"
+          echo "log_retention_days=${LOG_RETENTION}" >> "$GITHUB_OUTPUT"
+          echo "owner=${{ github.actor }}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+          echo "Configuration:"
+          echo "  Template: ${TEMPLATE}"
+          echo "  TTL: ${TTL}"
+          echo "  Image: ${CONTAINER_IMAGE}"
+          echo "  Port: ${CONTAINER_PORT}"
+          echo "  CPU: ${CPU}"
+          echo "  Memory: ${MEMORY}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name == 'push'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Decide action (provision / extend / destroy)
+        id: decide
+        run: |
+          set -euo pipefail
+          EVENT="${{ github.event_name }}"
+          ENV_NAME="${{ steps.sanitize.outputs.environment_name }}"
+
+          if [[ "$EVENT" == "delete" ]]; then
+            echo "action=destroy" >> "$GITHUB_OUTPUT"
+            echo "Action: destroy (branch deleted)"
+            exit 0
+          fi
+          if [[ "$EVENT" == "pull_request" ]]; then
+            echo "action=destroy" >> "$GITHUB_OUTPUT"
+            echo "Action: destroy (PR closed)"
+            exit 0
+          fi
+
+          METADATA_KEY="environments/${ENV_NAME}/metadata.json"
+          if aws s3 cp "s3://${STATE_BUCKET}/${METADATA_KEY}" /tmp/existing-metadata.json 2>/dev/null; then
+            STATUS=$(jq -r '.status // "unknown"' /tmp/existing-metadata.json)
+            if [[ "$STATUS" == "active" ]]; then
+              echo "action=extend" >> "$GITHUB_OUTPUT"
+              echo "Action: extend (active environment found)"
+              exit 0
+            fi
+          fi
+
+          echo "action=provision" >> "$GITHUB_OUTPUT"
+          echo "Action: provision (new environment)"
+
+  # -----------------------------------------------------------------
+  # Build Image — build and push Docker image to ECR
+  # -----------------------------------------------------------------
+  build-image:
+    name: Build Image
+    needs: setup
+    if: needs.setup.outputs.action == 'provision' || needs.setup.outputs.action == 'extend'
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      container_image: ${{ steps.resolve.outputs.container_image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine if Dockerfile exists
+        id: check
+        run: |
+          set -euo pipefail
+          DOCKERFILE="${{ needs.setup.outputs.dockerfile }}"
+          if [[ -n "$DOCKERFILE" ]]; then
+            if [[ -f "$DOCKERFILE" ]]; then
+              echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+              echo "dockerfile_path=${DOCKERFILE}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Configured dockerfile '${DOCKERFILE}' not found"
+              exit 1
+            fi
+          elif [[ -f "Dockerfile" ]]; then
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+            echo "dockerfile_path=Dockerfile" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check.outputs.has_dockerfile == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: steps.check.outputs.has_dockerfile == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        if: steps.check.outputs.has_dockerfile == 'true'
+        id: build
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          ECR_REPO="mini-idp-preview"
+          ENV_NAME="${{ needs.setup.outputs.environment_name }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"
+          FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+          BUILD_CONTEXT="${{ needs.setup.outputs.build_context }}"
+          DOCKERFILE="${{ steps.check.outputs.dockerfile_path }}"
+
+          docker build \
+            -t "${FULL_IMAGE}" \
+            -f "${DOCKERFILE}" \
+            --label "idp.environment=${ENV_NAME}" \
+            --label "idp.commit=${{ github.sha }}" \
+            --label "idp.branch=${{ github.ref_name }}" \
+            "${BUILD_CONTEXT}"
+
+          docker push "${FULL_IMAGE}"
+          echo "image_uri=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve final container image
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.check.outputs.has_dockerfile }}" == "true" ]]; then
+            echo "container_image=${{ steps.build.outputs.image_uri }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "container_image=${{ needs.setup.outputs.container_image }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # -----------------------------------------------------------------
+  # Provision / Extend / Destroy — delegated to mini-idp platform
+  # -----------------------------------------------------------------
+  provision:
+    name: Provision Preview
+    needs: [setup, build-image]
+    if: needs.setup.outputs.action == 'provision'
+    uses: AnerSarid/mini-idp/.github/workflows/provision.yml@main
+    with:
+      template: ${{ needs.setup.outputs.template }}
+      environment_name: ${{ needs.setup.outputs.environment_name }}
+      owner: ${{ needs.setup.outputs.owner }}
+      ttl: ${{ needs.setup.outputs.ttl }}
+      container_image: ${{ needs.build-image.outputs.container_image }}
+      container_port: ${{ needs.setup.outputs.container_port }}
+      schedule_expression: ${{ needs.setup.outputs.schedule_expression }}
+      s3_bucket_arn: ${{ needs.setup.outputs.s3_bucket_arn }}
+      environment_variables: ${{ needs.setup.outputs.environment_variables }}
+      secret_variables: ${{ needs.setup.outputs.secret_variables }}
+      cpu: ${{ needs.setup.outputs.cpu }}
+      memory: ${{ needs.setup.outputs.memory }}
+      log_retention_days: ${{ needs.setup.outputs.log_retention_days }}
+      acm_certificate_arn: ${{ vars.PREVIEW_ACM_CERT_ARN }}
+      route53_zone_id: ${{ vars.PREVIEW_ZONE_ID }}
+      preview_domain: ${{ vars.PREVIEW_DOMAIN }}
+    secrets: inherit
+
+  extend:
+    name: Extend & Redeploy
+    needs: [setup, build-image]
+    if: needs.setup.outputs.action == 'extend'
+    uses: AnerSarid/mini-idp/.github/workflows/provision.yml@main
+    with:
+      template: ${{ needs.setup.outputs.template }}
+      environment_name: ${{ needs.setup.outputs.environment_name }}
+      owner: ${{ needs.setup.outputs.owner }}
+      ttl: ${{ needs.setup.outputs.ttl }}
+      container_image: ${{ needs.build-image.outputs.container_image }}
+      container_port: ${{ needs.setup.outputs.container_port }}
+      schedule_expression: ${{ needs.setup.outputs.schedule_expression }}
+      s3_bucket_arn: ${{ needs.setup.outputs.s3_bucket_arn }}
+      environment_variables: ${{ needs.setup.outputs.environment_variables }}
+      secret_variables: ${{ needs.setup.outputs.secret_variables }}
+      cpu: ${{ needs.setup.outputs.cpu }}
+      memory: ${{ needs.setup.outputs.memory }}
+      log_retention_days: ${{ needs.setup.outputs.log_retention_days }}
+      acm_certificate_arn: ${{ vars.PREVIEW_ACM_CERT_ARN }}
+      route53_zone_id: ${{ vars.PREVIEW_ZONE_ID }}
+      preview_domain: ${{ vars.PREVIEW_DOMAIN }}
+    secrets: inherit
+
+  destroy:
+    name: Destroy Preview
+    needs: setup
+    if: needs.setup.outputs.action == 'destroy'
+    uses: AnerSarid/mini-idp/.github/workflows/destroy.yml@main
+    with:
+      environment_name: ${{ needs.setup.outputs.environment_name }}
+    secrets: inherit
+
+  # -----------------------------------------------------------------
+  # Comment — post preview URL on associated PR
+  # -----------------------------------------------------------------
+  comment:
+    name: Comment on PR
+    needs: [setup, provision, extend]
+    if: |
+      always() &&
+      needs.setup.outputs.action != 'destroy' &&
+      (needs.provision.result == 'success' || needs.extend.result == 'success')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find associated PR and post comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ENV_NAME="${{ needs.setup.outputs.environment_name }}"
+          ACTION="${{ needs.setup.outputs.action }}"
+
+          PR_NUMBER=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "${{ github.ref_name }}" \
+            --json number \
+            --jq '.[0].number // empty' 2>/dev/null || echo "")
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No PR found for branch ${{ github.ref_name }}, skipping comment."
+            exit 0
+          fi
+
+          EXPIRES_AT="unknown"
+          ENDPOINT="pending"
+          TEMPLATE="${{ needs.setup.outputs.template }}"
+
+          if aws s3 cp "s3://${STATE_BUCKET}/environments/${ENV_NAME}/metadata.json" /tmp/metadata.json 2>/dev/null; then
+            EXPIRES_AT=$(jq -r '.expires_at // "unknown"' /tmp/metadata.json)
+          fi
+          if aws s3 cp "s3://${STATE_BUCKET}/environments/${ENV_NAME}/outputs.json" /tmp/outputs.json 2>/dev/null; then
+            ENDPOINT=$(jq -r '.endpoint.value // .endpoint // "pending"' /tmp/outputs.json)
+          fi
+
+          if [[ "$ACTION" == "provision" ]]; then
+            STATUS_EMOJI="🚀"
+            STATUS_TEXT="created"
+          else
+            STATUS_EMOJI="🔄"
+            STATUS_TEXT="updated (TTL extended)"
+          fi
+
+          COMMENT_BODY="${STATUS_EMOJI} **Preview Environment ${STATUS_TEXT}**
+
+          | | |
+          |---|---|
+          | **Environment** | \`${ENV_NAME}\` |
+          | **URL** | ${ENDPOINT} |
+          | **Template** | \`${TEMPLATE}\` |
+          | **Expires** | ${EXPIRES_AT} |
+
+          > Automatically destroyed when this PR is merged or the branch is deleted."
+
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | contains("Preview Environment")) | .id' \
+            2>/dev/null | head -1 || echo "")
+
+          if [[ -n "$EXISTING_COMMENT_ID" ]]; then
+            gh api --method PATCH \
+              "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
+              -f body="${COMMENT_BODY}"
+          else
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${{ github.repository }}" \
+              --body "${COMMENT_BODY}"
+          fi
+
+  # -----------------------------------------------------------------
+  # Dashboard — update central ENVIRONMENTS.md in mini-idp repo
+  # -----------------------------------------------------------------
+  dashboard:
+    name: Update Dashboard
+    needs: [setup, provision, extend, destroy]
+    if: |
+      always() &&
+      (needs.provision.result == 'success' ||
+       needs.extend.result == 'success' ||
+       needs.destroy.result == 'success')
+    uses: AnerSarid/mini-idp/.github/workflows/update-dashboard.yml@main
     secrets: inherit

@@ -1,0 +1,32 @@
+# Preview Environment — powered by mini-idp
+#
+# Calls the reusable workflow from the mini-idp platform repo.
+# Configuration is read from .idp/config.yml in this repository.
+#
+# Required setup in this repo's GitHub Settings:
+#   Secrets:  AWS_ROLE_ARN
+#   Variables: PREVIEW_ACM_CERT_ARN, PREVIEW_ZONE_ID, PREVIEW_DOMAIN
+
+name: Preview Environment
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - master
+
+  pull_request:
+    types: [closed]
+
+  delete:
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  preview:
+    uses: AnerSarid/mini-idp/.github/workflows/preview-env.yml@main
+    secrets: inherit

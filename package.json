@@ -1,0 +1,13 @@
+{
+  "name": "mini-idp-demo-app",
+  "version": "1.0.0",
+  "description": "Demo API with PostgreSQL — tests the mini-idp api-database template",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "pg": "^8.13.0"
+  }
+}

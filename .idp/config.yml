@@ -1,0 +1,12 @@
+# Preview environment configuration for mini-idp
+# Uses the api-database template: ECS Fargate + ALB + RDS PostgreSQL
+template: api-database
+
+container_port: 3000
+ttl: 1d
+
+environment:
+  NODE_ENV: preview
+  LOG_LEVEL: debug
+  APP_NAME: mini-idp-demo-app
+  PORT: "3000"

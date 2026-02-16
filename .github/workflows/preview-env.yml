@@ -64,6 +64,7 @@ jobs:
       cpu: ${{ steps.config.outputs.cpu }}
       memory: ${{ steps.config.outputs.memory }}
       log_retention_days: ${{ steps.config.outputs.log_retention_days }}
+      use_shared_networking: ${{ steps.config.outputs.use_shared_networking }}
 
     steps:
       - name: Checkout code
@@ -125,6 +126,7 @@ jobs:
             CPU=$(yq eval '.cpu // "256"' "$CONFIG_FILE")
             MEMORY=$(yq eval '.memory // "512"' "$CONFIG_FILE")
             LOG_RETENTION=$(yq eval '.log_retention_days // "3"' "$CONFIG_FILE")
+            USE_SHARED=$(yq eval '.use_shared_networking // ""' "$CONFIG_FILE")
           else
             echo "Using defaults (no config file or non-push event)..."
             TEMPLATE="api-service"
@@ -140,7 +142,15 @@ jobs:
             CPU="256"
             MEMORY="512"
             LOG_RETENTION="3"
+            USE_SHARED=""
           fi
+
+          # Shared networking: config.yml > repo variable > default false
+          if [[ -z "$USE_SHARED" ]]; then
+            USE_SHARED="${{ vars.USE_SHARED_NETWORKING }}"
+          fi
+          USE_SHARED="${USE_SHARED:-false}"
+
           echo "template=${TEMPLATE}" >> "$GITHUB_OUTPUT"
           echo "ttl=${TTL}" >> "$GITHUB_OUTPUT"
           echo "container_image=${CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
@@ -154,6 +164,7 @@ jobs:
           echo "cpu=${CPU}" >> "$GITHUB_OUTPUT"
           echo "memory=${MEMORY}" >> "$GITHUB_OUTPUT"
           echo "log_retention_days=${LOG_RETENTION}" >> "$GITHUB_OUTPUT"
+          echo "use_shared_networking=${USE_SHARED}" >> "$GITHUB_OUTPUT"
           echo "owner=${{ github.actor }}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
 
           echo "Configuration:"
@@ -310,6 +321,7 @@ jobs:
       acm_certificate_arn: ${{ vars.PREVIEW_ACM_CERT_ARN }}
       route53_zone_id: ${{ vars.PREVIEW_ZONE_ID }}
       preview_domain: ${{ vars.PREVIEW_DOMAIN }}
+      use_shared_networking: ${{ needs.setup.outputs.use_shared_networking }}
     secrets: inherit
 
   extend:
@@ -334,6 +346,7 @@ jobs:
       acm_certificate_arn: ${{ vars.PREVIEW_ACM_CERT_ARN }}
       route53_zone_id: ${{ vars.PREVIEW_ZONE_ID }}
       preview_domain: ${{ vars.PREVIEW_DOMAIN }}
+      use_shared_networking: ${{ needs.setup.outputs.use_shared_networking }}
     secrets: inherit
 
   destroy:
